@@ -17,6 +17,7 @@ from .subscribeoptions import SubscribeOptions
 from .reasoncodes import ReasonCodes
 from .properties import Properties
 from .matcher import MQTTMatcher
+from hashlib import blake2s
 import logging
 import hashlib
 import string
@@ -86,6 +87,16 @@ if sys.version_info[0] >= 3:
     # define some alias for python2 compatibility
     unicode = str
     basestring = str
+
+# Authentication Data
+try:
+    import configparser
+    config = configparser.ConfigParser(delimiters=(':'))
+    config.optionxform = str
+    config.read('config.cfg')
+    AUTH_METHOD = config.sections()[0]
+except :
+    AUTH_METHOD = "H_SHARED_KEY"
 
 # Message types
 CONNECT = 0x10
@@ -513,7 +524,8 @@ class Client(object):
     """
 
     def __init__(self, client_id="", clean_session=None, userdata=None,
-                 protocol=MQTTv311, transport="tcp"):
+#                 protocol=MQTTv311, transport="tcp"):
+                 protocol=MQTTv5, transport="tcp"):
         """client_id is the unique client id string used when connecting to the
         broker. If client_id is zero length or None, then the behaviour is
         defined by which protocol version is in use. If using MQTT v3.1.1, then
@@ -655,6 +667,8 @@ class Client(object):
         # for clean_start == MQTT_CLEAN_START_FIRST_ONLY
         self._mqttv5_first_connect = True
         self.suppress_exceptions = False # For callbacks
+        self._auth_method = AUTH_METHOD
+        self._auth_data = None
 
     def __del__(self):
         self._reset_sockets()
@@ -2616,10 +2630,15 @@ class Client(object):
 
         if self._protocol == MQTTv5:
             if self._connect_properties == None:
-                packed_connect_properties = b'\x00'
+#                packed_connect_properties = b'\x00'
+                properties = Properties(AUTH >> 4)
+                properties.AuthenticationMethod = self._auth_method
+                packed_connect_properties = properties.pack()
             else:
                 packed_connect_properties = self._connect_properties.pack()
+
             remaining_length += len(packed_connect_properties)
+
             if self._will:
                 if self._will_properties == None:
                     packed_will_properties = b'\x00'
@@ -2720,6 +2739,84 @@ class Client(object):
                     packet += packed_props
 
         return self._packet_queue(command, packet, 0, 0)
+
+    # Sends the AUTH packet
+    def _send_auth(self, reasoncode=None, properties=None):
+        if self._protocol == MQTTv5:
+            self._easy_log(MQTT_LOG_DEBUG, "Sending AUTH reasonCode=%s properties=%s",
+                           reasoncode,
+                           properties
+                           )
+        else:
+            self._easy_log(MQTT_LOG_DEBUG, "Sending AUTH")
+
+        remaining_length = 0
+
+        command = AUTH
+        packet = bytearray()
+        packet.append(command)
+
+        if self._protocol == MQTTv5:
+            if reasoncode == None:
+                reasoncode = ReasonCodes(AUTH >> 4, identifier=24)
+            remaining_length += 1
+            if properties != None:
+                packed_props = properties.pack()
+
+            if properties == None:
+                properties = Properties(AUTH >> 4)
+                properties.AuthenticationMethod = self._auth_method
+                properties.AuthenticationData = self._auth_data
+                packed_props = properties.pack()
+
+            remaining_length += len(packed_props)
+
+        self._pack_remaining_length(packet, remaining_length)
+
+        if self._protocol == MQTTv5:
+            if reasoncode != None:
+                packet += reasoncode.pack()
+                if properties != None:
+                    packet += packed_props
+
+        return self._packet_queue(command, packet, 0, 0)
+
+    def _send_subscribe(self, dup, topics, properties=None):
+        remaining_length = 2
+        if self._protocol == MQTTv5:
+            if properties == None:
+                packed_subscribe_properties = b'\x00'
+            else:
+                packed_subscribe_properties = properties.pack()
+            remaining_length += len(packed_subscribe_properties)
+        for t, _ in topics:
+            remaining_length += 2 + len(t) + 1
+
+        command = SUBSCRIBE | (dup << 3) | 0x2
+        packet = bytearray()
+        packet.append(command)
+        self._pack_remaining_length(packet, remaining_length)
+        local_mid = self._mid_generate()
+        packet.extend(struct.pack("!H", local_mid))
+
+        if self._protocol == MQTTv5:
+            packet += packed_subscribe_properties
+
+        for t, q in topics:
+            self._pack_str16(packet, t)
+            if self._protocol == MQTTv5:
+                packet += q.pack()
+            else:
+                packet.append(q)
+
+        self._easy_log(
+            MQTT_LOG_DEBUG,
+            "Sending SUBSCRIBE (d%d, m%d) %s",
+            dup,
+            local_mid,
+            topics,
+        )
+        return (self._packet_queue(command, packet, local_mid, 1), local_mid)
 
     def _send_subscribe(self, dup, topics, properties=None):
         remaining_length = 2
@@ -2923,7 +3020,9 @@ class Client(object):
 
     def _packet_handle(self):
         cmd = self._in_packet['command'] & 0xF0
-        if cmd == PINGREQ:
+        if cmd == AUTH:
+            return self._handle_auth()
+        elif cmd == PINGREQ:
             return self._handle_pingreq()
         elif cmd == PINGRESP:
             return self._handle_pingresp()
@@ -3022,8 +3121,8 @@ class Client(object):
                 with self._in_callback_mutex:
                     try:
                         if self._protocol == MQTTv5:
-                            self.on_connect(self, self._userdata,
-                                            flags_dict, reason, properties)
+                            self.on_connect(
+                                self, self._userdata, flags_dict, result)
                         else:
                             self.on_connect(
                                 self, self._userdata, flags_dict, result)
@@ -3099,6 +3198,137 @@ class Client(object):
             return rc
         elif result > 0 and result < 6:
             return MQTT_ERR_CONN_REFUSED
+        else:
+            return MQTT_ERR_PROTOCOL
+
+    # Handles the auth response from the broker
+    def _handle_auth(self):
+        if self._protocol == MQTTv5:
+            if self._in_packet['remaining_length'] < 2:
+                return MQTT_ERR_PROTOCOL
+        elif self._in_packet['remaining_length'] != 2:
+            return MQTT_ERR_PROTOCOL
+        if self._protocol == MQTTv5:
+            result = self._in_packet['packet'][0]
+            reason = ReasonCodes(AUTH >> 4, identifier=result)
+            properties = Properties(AUTH >> 4)
+            properties.unpack(self._in_packet['packet'][1:])
+
+        if self._protocol == MQTTv311:
+            if result == CONNACK_REFUSED_PROTOCOL_VERSION:
+                self._easy_log(
+                    MQTT_LOG_DEBUG,
+                    "Received AUTH (%s), attempting downgrade to MQTT v3.1.",
+                    result
+                )
+                # Downgrade to MQTT v3.1
+                self._protocol = MQTTv31
+                return self.reconnect()
+            elif (result == CONNACK_REFUSED_IDENTIFIER_REJECTED
+                    and self._client_id == b''):
+                self._easy_log(
+                    MQTT_LOG_DEBUG,
+                    "Received AUTH (%s), attempting to use non-empty CID",
+                    result,
+                )
+                self._client_id = base62(uuid.uuid4().int, padding=22)
+                return self.reconnect()
+
+        if result == 24:
+            self._state = mqtt_cs_connected
+            self._reconnect_delay = None
+
+        if result == 0:
+            self._state = mqtt_cs_connected
+            self._reconnect_delay = None
+
+        if self._protocol == MQTTv5:
+            self._easy_log(
+                MQTT_LOG_DEBUG, "Received AUTH (%s) properties=%s", reason, properties)
+        else:
+            self._easy_log(
+                MQTT_LOG_DEBUG, "Received AUTH (%s)", result)
+
+        # it won't be the first successful connect any more
+        self._mqttv5_first_connect = False
+
+        random_key = properties.AuthenticationData
+        shared_key = config.get(config.sections()[0], properties.UserProperty[0][1]).encode()
+
+        encoded_string = random_key + shared_key
+
+        blake2s_hash = blake2s(digest_size=10)
+        blake2s_hash.update(encoded_string)
+
+        properties.AuthenticationData = blake2s_hash.hexdigest().encode()
+        self._send_auth(reason, properties)
+
+        if result == 24:
+            rc = 0
+            with self._out_message_mutex:
+                for m in self._out_messages.values():
+                    m.timestamp = time_func()
+                    if m.state == mqtt_ms_queued:
+                        self.loop_write()  # Process outgoing messages that have just been queued up
+                        return MQTT_ERR_SUCCESS
+
+                    if m.qos == 0:
+                        with self._in_callback_mutex:  # Don't call loop_write after _send_publish()
+                            rc = self._send_publish(
+                                m.mid,
+                                m.topic.encode('utf-8'),
+                                m.payload,
+                                m.qos,
+                                m.retain,
+                                m.dup,
+                                properties=m.properties
+                            )
+                        if rc != 0:
+                            return rc
+                    elif m.qos == 1:
+                        if m.state == mqtt_ms_publish:
+                            self._inflight_messages += 1
+                            m.state = mqtt_ms_wait_for_puback
+                            with self._in_callback_mutex:  # Don't call loop_write after _send_publish()
+                                rc = self._send_publish(
+                                    m.mid,
+                                    m.topic.encode('utf-8'),
+                                    m.payload,
+                                    m.qos,
+                                    m.retain,
+                                    m.dup,
+                                    properties=m.properties
+                                )
+                            if rc != 0:
+                                return rc
+                    elif m.qos == 2:
+                        if m.state == mqtt_ms_publish:
+                            self._inflight_messages += 1
+                            m.state = mqtt_ms_wait_for_pubrec
+                            with self._in_callback_mutex:  # Don't call loop_write after _send_publish()
+                                rc = self._send_publish(
+                                    m.mid,
+                                    m.topic.encode('utf-8'),
+                                    m.payload,
+                                    m.qos,
+                                    m.retain,
+                                    m.dup,
+                                    properties=m.properties
+                                )
+                            if rc != 0:
+                                return rc
+                        elif m.state == mqtt_ms_resend_pubrel:
+                            self._inflight_messages += 1
+                            m.state = mqtt_ms_wait_for_pubcomp
+                            with self._in_callback_mutex:  # Don't call loop_write after _send_publish()
+                                rc = self._send_pubrel(m.mid)
+                            if rc != 0:
+                                return rc
+                    self.loop_write()  # Process outgoing messages that have just been queued up
+            return rc
+        elif result > 0 and result < 6:
+            return MQTT_ERR_CONN_REFUSED
+
         else:
             return MQTT_ERR_PROTOCOL
 
